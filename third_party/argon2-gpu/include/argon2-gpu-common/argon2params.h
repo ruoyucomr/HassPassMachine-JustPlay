@@ -1,6 +1,7 @@
 #ifndef ARGON2_ARGON2PARAMS_H
 #define ARGON2_ARGON2PARAMS_H
 
+#include <cstddef>
 #include <cstdint>
 
 #include "argon2-common.h"

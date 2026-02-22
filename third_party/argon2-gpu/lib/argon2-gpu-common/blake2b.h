@@ -1,6 +1,7 @@
 #ifndef ARGON2_BLAKE2B_H
 #define ARGON2_BLAKE2B_H
 
+#include <cstddef>
 #include <cstdint>
 
 namespace argon2 {

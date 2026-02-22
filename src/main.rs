@@ -152,7 +152,7 @@ fn count_leading_zero_bits(hash: &[u8]) -> u32 {
 }
 
 #[inline(always)]
-fn throttle_if_needed(max_hps: f64, start_time: Instant, total_hashes: u64) {
+fn delay_for_speed_limit(max_hps: f64, difficulty: u32, start_time: Instant) {
     if max_hps <= 0.0 {
         return;
     }
@@ -160,7 +160,11 @@ fn throttle_if_needed(max_hps: f64, start_time: Instant, total_hashes: u64) {
     if elapsed <= 0.0 {
         return;
     }
-    let target_elapsed = total_hashes as f64 / max_hps;
+    let expected_hashes = 2.0_f64.powi(difficulty as i32);
+    if !expected_hashes.is_finite() {
+        return;
+    }
+    let target_elapsed = expected_hashes / max_hps;
     if target_elapsed > elapsed {
         let sleep = target_elapsed - elapsed;
         if sleep > 0.0 {
@@ -179,8 +183,6 @@ fn mine_worker(
     memory_cost: u32,
     time_cost: u32,
     parallelism: u32,
-    start_time: Instant,
-    max_hps: f64,
     found: Arc<AtomicBool>,
     tx: tokio::sync::mpsc::Sender<MiningResult>,
     best: Arc<std::sync::Mutex<BestHashState>>,
@@ -214,7 +216,7 @@ fn mine_worker(
         )
         .unwrap();
 
-        let total = hash_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        hash_counter.fetch_add(1, Ordering::Relaxed);
 
         let zeros = count_leading_zero_bits(&hash_output);
 
@@ -231,7 +233,6 @@ fn mine_worker(
         }
 
         if zeros >= difficulty {
-            throttle_if_needed(max_hps, start_time, total);
             found.store(true, Ordering::SeqCst);
             let _ = tx.blocking_send(MiningResult {
                 nonce,
@@ -239,8 +240,6 @@ fn mine_worker(
             });
             return;
         }
-
-        throttle_if_needed(max_hps, start_time, total);
 
         nonce += thread_count as u64;
     }
@@ -251,8 +250,6 @@ fn gpu_worker(
     mut miner: gpu::GpuMiner,
     difficulty: u32,
     batch_size: usize,
-    start_time: Instant,
-    max_hps: f64,
     found: Arc<AtomicBool>,
     tx: tokio::sync::mpsc::Sender<MiningResult>,
     best: Arc<std::sync::Mutex<BestHashState>>,
@@ -277,10 +274,7 @@ fn gpu_worker(
             return;
         }
 
-        let total = hash_counter.fetch_add(batch_size as u64, Ordering::Relaxed)
-            + batch_size as u64;
-
-        throttle_if_needed(max_hps, start_time, total);
+        hash_counter.fetch_add(batch_size as u64, Ordering::Relaxed);
 
         for i in 0..batch_size {
             let offset = i * 32;
@@ -335,7 +329,6 @@ impl CpuMiningJob {
         time_cost: u32,
         parallelism: u32,
         thread_count: u32,
-        max_hps: f64,
         solution_tx: tokio::sync::mpsc::Sender<MiningResult>,
     ) -> Self {
         let found = Arc::new(AtomicBool::new(false));
@@ -356,9 +349,6 @@ impl CpuMiningJob {
             let ip_c = ip.to_string();
             let best = best.clone();
             let counter = hash_counter.clone();
-            let job_start = start_time;
-            let max_hps = max_hps;
-
             handles.push(std::thread::spawn(move || {
                 mine_worker(
                     i,
@@ -370,8 +360,6 @@ impl CpuMiningJob {
                     memory_cost,
                     time_cost,
                     parallelism,
-                    job_start,
-                    max_hps,
                     found,
                     tx,
                     best,
@@ -449,7 +437,6 @@ impl GpuMiningJob {
         parallelism: u32,
         device_index: usize,
         batch_size: usize,
-        max_hps: f64,
         solution_tx: tokio::sync::mpsc::Sender<MiningResult>,
     ) -> anyhow::Result<Self> {
         let found = Arc::new(AtomicBool::new(false));
@@ -480,8 +467,6 @@ impl GpuMiningJob {
                 miner,
                 difficulty,
                 actual_batch,
-                start_time,
-                max_hps,
                 found_t,
                 solution_tx,
                 best_t,
@@ -549,7 +534,6 @@ impl MiningJob {
         time_cost: u32,
         parallelism: u32,
         thread_count: u32,
-        max_hps: f64,
         solution_tx: tokio::sync::mpsc::Sender<MiningResult>,
     ) -> Self {
         MiningJob::Cpu(CpuMiningJob::start(
@@ -561,7 +545,6 @@ impl MiningJob {
             time_cost,
             parallelism,
             thread_count,
-            max_hps,
             solution_tx,
         ))
     }
@@ -577,7 +560,6 @@ impl MiningJob {
         parallelism: u32,
         device_index: usize,
         batch_size: usize,
-        max_hps: f64,
         solution_tx: tokio::sync::mpsc::Sender<MiningResult>,
     ) -> anyhow::Result<Self> {
         Ok(MiningJob::Gpu(GpuMiningJob::start(
@@ -590,7 +572,6 @@ impl MiningJob {
             parallelism,
             device_index,
             batch_size,
-            max_hps,
             solution_tx,
         )?))
     }
@@ -714,6 +695,7 @@ async fn handle_ws_connection(
     // 持久 solution 通道 — 跨多轮挖矿复用
     let (solution_tx, mut solution_rx) = tokio::sync::mpsc::channel::<MiningResult>(4);
     let mut mining_job: Option<MiningJob> = None;
+    let mut current_difficulty: Option<u32> = None;
     let mut status_interval = tokio::time::interval(Duration::from_secs(2));
 
     loop {
@@ -735,6 +717,7 @@ async fn handle_ws_connection(
                                 }
                                 // 排空旧 solution
                                 while solution_rx.try_recv().is_ok() {}
+                                current_difficulty = Some(difficulty);
 
                                 if config.use_gpu {
                                     println!(
@@ -759,7 +742,6 @@ async fn handle_ws_connection(
                                             parallelism,
                                             config.gpu_device,
                                             config.gpu_batch,
-                                            config.max_hps,
                                             solution_tx.clone(),
                                         );
                                         mining_job = Some(match job {
@@ -776,7 +758,6 @@ async fn handle_ws_connection(
                                                     time_cost,
                                                     parallelism,
                                                     config.threads,
-                                                    config.max_hps,
                                                     solution_tx.clone(),
                                                 )
                                             }
@@ -794,7 +775,6 @@ async fn handle_ws_connection(
                                             time_cost,
                                             parallelism,
                                             config.threads,
-                                            config.max_hps,
                                             solution_tx.clone(),
                                         ));
                                     }
@@ -818,7 +798,6 @@ async fn handle_ws_connection(
                                         time_cost,
                                         parallelism,
                                         config.threads,
-                                        config.max_hps,
                                         solution_tx.clone(),
                                     ));
                                 }
@@ -836,6 +815,7 @@ async fn handle_ws_connection(
                                 } else {
                                     (0, String::new(), 0)
                                 };
+                                current_difficulty = None;
                                 let msg = ServerMsg::Stopped {
                                     best_nonce: nonce,
                                     best_hash: hash,
@@ -871,6 +851,9 @@ async fn handle_ws_connection(
             result = solution_rx.recv() => {
                 if let Some(result) = result {
                     if let Some(job) = mining_job.as_ref() {
+                        if let Some(diff) = current_difficulty {
+                            delay_for_speed_limit(config.max_hps, diff, job.start_time());
+                        }
                         let elapsed = job.start_time().elapsed();
                         println!(
                             "[+] 找到解! nonce={} hash={}... 耗时={:.2}s",
