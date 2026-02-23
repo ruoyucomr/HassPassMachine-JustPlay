@@ -183,8 +183,6 @@ fn u64_to_ascii_inplace(buf: &mut [u8], n: u64) -> usize {
 }
 
 #[inline(always)]
-
-#[inline(always)]
 fn u64_to_ascii_slice(buf: &mut [u8], n: u64) -> (usize, usize) {
     if n == 0 {
         let idx = buf.len() - 1;
@@ -278,7 +276,7 @@ fn mine_worker(
             &nonce_buf[nonce_start..nonce_start + nonce_len],
             salt_bytes,
             &mut hash_output,
-            memory,
+            memory.as_mut_slice(),
         )
         .unwrap();
 
@@ -292,7 +290,6 @@ fn mine_worker(
         if zeros >= difficulty {
             if local_count > 0 {
                 hash_counter.fetch_add(local_count, Ordering::Relaxed);
-                local_count = 0;
             }
             found.store(true, Ordering::SeqCst);
             let _ = tx.blocking_send(MiningResult {
@@ -458,8 +455,6 @@ impl CpuMiningJob {
         let hash_counter = Arc::new(AtomicU64::new(0));
         let best_zeros = Arc::new(AtomicU32::new(0));
         let best_nonce = Arc::new(AtomicU64::new(0));
-        let best_zeros = Arc::new(AtomicU32::new(0));
-        let best_nonce = Arc::new(AtomicU64::new(0));
 
         let start_time = Instant::now();
         let mut handles = Vec::with_capacity(thread_count as usize);
@@ -470,6 +465,8 @@ impl CpuMiningJob {
             let vid = visitor_id.to_string();
             let ip_c = ip.to_string();
             let best = best.clone();
+            let best_zeros_t = best_zeros.clone();
+            let best_nonce_t = best_nonce.clone();
             let counter = hash_counter.clone();
             handles.push(std::thread::spawn(move || {
                 mine_worker(
@@ -485,8 +482,8 @@ impl CpuMiningJob {
                     found,
                     tx,
                     best,
-                    best_zeros.clone(),
-                    best_nonce.clone(),
+                    best_zeros_t,
+                    best_nonce_t,
                     counter,
                 );
             }));
@@ -577,8 +574,6 @@ impl GpuMiningJob {
         let hash_counter = Arc::new(AtomicU64::new(0));
         let best_zeros = Arc::new(AtomicU32::new(0));
         let best_nonce = Arc::new(AtomicU64::new(0));
-        let best_zeros = Arc::new(AtomicU32::new(0));
-        let best_nonce = Arc::new(AtomicU64::new(0));
 
         let salt = format!("{}|{}|{}", seed, visitor_id, ip);
         let miner = gpu::GpuMiner::new(
@@ -593,6 +588,8 @@ impl GpuMiningJob {
 
         let found_t = found.clone();
         let best_t = best.clone();
+        let best_zeros_t = best_zeros.clone();
+        let best_nonce_t = best_nonce.clone();
         let counter_t = hash_counter.clone();
         let start_time = Instant::now();
         let handle = std::thread::spawn(move || {
@@ -603,8 +600,8 @@ impl GpuMiningJob {
                 found_t,
                 solution_tx,
                 best_t,
-                best_zeros.clone(),
-                best_nonce.clone(),
+                best_zeros_t,
+                best_nonce_t,
                 counter_t,
             );
         });
