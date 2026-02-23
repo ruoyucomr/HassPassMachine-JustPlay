@@ -200,6 +200,8 @@ fn mine_worker(
     let mut nonce_buf = [0u8; 20];
 
     let mut nonce = thread_id as u64;
+    let mut local_best_zeros: u32 = 0;
+    let mut local_best_nonce: u64 = u64::MAX;
 
     loop {
         if found.load(Ordering::Relaxed) {
@@ -217,20 +219,7 @@ fn mine_worker(
         .unwrap();
 
         hash_counter.fetch_add(1, Ordering::Relaxed);
-
         let zeros = count_leading_zero_bits(&hash_output);
-
-        // 仅在有改善时加锁更新
-        {
-            let mut best_lock = best.lock().unwrap();
-            if zeros > best_lock.leading_zeros
-                || (zeros == best_lock.leading_zeros && nonce < best_lock.nonce)
-            {
-                best_lock.leading_zeros = zeros;
-                best_lock.nonce = nonce;
-                best_lock.hash_hex = hex::encode(hash_output);
-            }
-        }
 
         if zeros >= difficulty {
             found.store(true, Ordering::SeqCst);
@@ -239,6 +228,19 @@ fn mine_worker(
                 hash_hex: hex::encode(hash_output),
             });
             return;
+        }
+
+        if zeros > local_best_zeros || (zeros == local_best_zeros && nonce < local_best_nonce) {
+            let mut best_lock = best.lock().unwrap();
+            if zeros > best_lock.leading_zeros
+                || (zeros == best_lock.leading_zeros && nonce < best_lock.nonce)
+            {
+                best_lock.leading_zeros = zeros;
+                best_lock.nonce = nonce;
+                best_lock.hash_hex = hex::encode(hash_output);
+            }
+            local_best_zeros = best_lock.leading_zeros;
+            local_best_nonce = best_lock.nonce;
         }
 
         nonce += thread_count as u64;
@@ -260,6 +262,8 @@ fn gpu_worker(
     let mut pw_lens = vec![0u32; batch_size];
     let mut hashes = vec![0u8; batch_size * 32];
     let mut nonce_base = 0u64;
+    let mut local_best_zeros: u32 = 0;
+    let mut local_best_nonce: u64 = u64::MAX;
 
     while !found.load(Ordering::Relaxed) {
         for i in 0..batch_size {
@@ -281,8 +285,14 @@ fn gpu_worker(
             let hash = &hashes[offset..offset + 32];
             let zeros = count_leading_zero_bits(hash);
             let nonce = nonce_base + i as u64;
+            if zeros >= difficulty {
+                found.store(true, Ordering::SeqCst);
+                let hash_hex = hex::encode(hash);
+                let _ = tx.blocking_send(MiningResult { nonce, hash_hex });
+                return;
+            }
 
-            {
+            if zeros > local_best_zeros || (zeros == local_best_zeros && nonce < local_best_nonce) {
                 let mut best_lock = best.lock().unwrap();
                 if zeros > best_lock.leading_zeros
                     || (zeros == best_lock.leading_zeros && nonce < best_lock.nonce)
@@ -291,13 +301,8 @@ fn gpu_worker(
                     best_lock.nonce = nonce;
                     best_lock.hash_hex = hex::encode(hash);
                 }
-            }
-
-            if zeros >= difficulty {
-                found.store(true, Ordering::SeqCst);
-                let hash_hex = hex::encode(hash);
-                let _ = tx.blocking_send(MiningResult { nonce, hash_hex });
-                return;
+                local_best_zeros = best_lock.leading_zeros;
+                local_best_nonce = best_lock.nonce;
             }
         }
 
