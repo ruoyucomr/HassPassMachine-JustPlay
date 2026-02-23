@@ -8,8 +8,8 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::io::Write as IoWrite;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -20,6 +20,50 @@ mod gpu;
 
 const INVITE_CODE_FILE: &str = "invite_codes.txt";
 const DEFAULT_PORT: u16 = 19526;
+
+static ARGON2_MEM_POOL: OnceLock<Mutex<Vec<Vec<argon2::Block>>>> = OnceLock::new();
+
+fn take_argon2_memory(block_count: usize) -> Vec<argon2::Block> {
+    let pool = ARGON2_MEM_POOL.get_or_init(|| Mutex::new(Vec::new()));
+    let mut guard = pool.lock().unwrap();
+    if let Some(pos) = guard.iter().position(|v| v.len() >= block_count) {
+        let mut mem = guard.swap_remove(pos);
+        mem.truncate(block_count);
+        return mem;
+    }
+    vec![argon2::Block::default(); block_count]
+}
+
+fn return_argon2_memory(mem: Vec<argon2::Block>) {
+    if mem.is_empty() {
+        return;
+    }
+    let pool = ARGON2_MEM_POOL.get_or_init(|| Mutex::new(Vec::new()));
+    let mut guard = pool.lock().unwrap();
+    guard.push(mem);
+}
+
+struct Argon2MemoryGuard {
+    mem: Option<Vec<argon2::Block>>,
+}
+
+impl Argon2MemoryGuard {
+    fn new(mem: Vec<argon2::Block>) -> Self {
+        Self { mem: Some(mem) }
+    }
+
+    fn as_mut(&mut self) -> &mut Vec<argon2::Block> {
+        self.mem.as_mut().expect("memory not set")
+    }
+}
+
+impl Drop for Argon2MemoryGuard {
+    fn drop(&mut self) {
+        if let Some(mem) = self.mem.take() {
+            return_argon2_memory(mem);
+        }
+    }
+}
 
 #[derive(Clone)]
 struct RuntimeConfig {
@@ -115,12 +159,13 @@ struct MiningResult {
 
 struct BestHashState {
     nonce: u64,
-    hash_hex: String,
+    hash: [u8; 32],
     leading_zeros: u32,
+    has_hash: bool,
 }
 
 #[inline(always)]
-fn u64_to_ascii(buf: &mut [u8], n: u64) -> usize {
+fn u64_to_ascii_inplace(buf: &mut [u8], n: u64) -> usize {
     if n == 0 {
         buf[0] = b'0';
         return 1;
@@ -138,6 +183,23 @@ fn u64_to_ascii(buf: &mut [u8], n: u64) -> usize {
 }
 
 #[inline(always)]
+
+#[inline(always)]
+fn u64_to_ascii_slice(buf: &mut [u8], n: u64) -> (usize, usize) {
+    if n == 0 {
+        let idx = buf.len() - 1;
+        buf[idx] = b'0';
+        return (idx, 1);
+    }
+    let mut pos = buf.len();
+    let mut v = n;
+    while v > 0 {
+        pos -= 1;
+        buf[pos] = (v % 10) as u8 + b'0';
+        v /= 10;
+    }
+    (pos, buf.len() - pos)
+}
 fn count_leading_zero_bits(hash: &[u8]) -> u32 {
     let mut bits = 0u32;
     for &byte in hash {
@@ -186,6 +248,8 @@ fn mine_worker(
     found: Arc<AtomicBool>,
     tx: tokio::sync::mpsc::Sender<MiningResult>,
     best: Arc<std::sync::Mutex<BestHashState>>,
+    best_zeros: Arc<AtomicU32>,
+    best_nonce: Arc<AtomicU64>,
     hash_counter: Arc<AtomicU64>,
 ) {
     let salt_str = format!("{}|{}|{}", seed, visitor_id, ip);
@@ -195,33 +259,41 @@ fn mine_worker(
     let block_count = params.block_count();
     let ctx = Argon2::new(Algorithm::Argon2d, Version::V0x13, params);
 
-    let mut memory = vec![argon2::Block::default(); block_count];
+    let mut memory_guard = Argon2MemoryGuard::new(take_argon2_memory(block_count));
+    let memory = memory_guard.as_mut();
     let mut hash_output = [0u8; 32];
     let mut nonce_buf = [0u8; 20];
 
     let mut nonce = thread_id as u64;
-    let mut local_best_zeros: u32 = 0;
-    let mut local_best_nonce: u64 = u64::MAX;
+    let mut local_count: u64 = 0;
 
     loop {
         if found.load(Ordering::Relaxed) {
-            return;
+            break;
         }
 
-        let nonce_len = u64_to_ascii(&mut nonce_buf, nonce);
+        let (nonce_start, nonce_len) = u64_to_ascii_slice(&mut nonce_buf, nonce);
 
         ctx.hash_password_into_with_memory(
-            &nonce_buf[..nonce_len],
+            &nonce_buf[nonce_start..nonce_start + nonce_len],
             salt_bytes,
             &mut hash_output,
-            &mut memory,
+            memory,
         )
         .unwrap();
 
-        hash_counter.fetch_add(1, Ordering::Relaxed);
+        local_count += 1;
+        if local_count >= 64 {
+            hash_counter.fetch_add(local_count, Ordering::Relaxed);
+            local_count = 0;
+        }
         let zeros = count_leading_zero_bits(&hash_output);
 
         if zeros >= difficulty {
+            if local_count > 0 {
+                hash_counter.fetch_add(local_count, Ordering::Relaxed);
+                local_count = 0;
+            }
             found.store(true, Ordering::SeqCst);
             let _ = tx.blocking_send(MiningResult {
                 nonce,
@@ -230,20 +302,41 @@ fn mine_worker(
             return;
         }
 
-        if zeros > local_best_zeros || (zeros == local_best_zeros && nonce < local_best_nonce) {
+        let best_z = best_zeros.load(Ordering::Relaxed);
+        if zeros > best_z {
             let mut best_lock = best.lock().unwrap();
             if zeros > best_lock.leading_zeros
                 || (zeros == best_lock.leading_zeros && nonce < best_lock.nonce)
             {
                 best_lock.leading_zeros = zeros;
                 best_lock.nonce = nonce;
-                best_lock.hash_hex = hex::encode(hash_output);
+                best_lock.hash.copy_from_slice(&hash_output);
+                best_lock.has_hash = true;
+                best_zeros.store(best_lock.leading_zeros, Ordering::Relaxed);
+                best_nonce.store(best_lock.nonce, Ordering::Relaxed);
             }
-            local_best_zeros = best_lock.leading_zeros;
-            local_best_nonce = best_lock.nonce;
+        } else if zeros == best_z {
+            let best_n = best_nonce.load(Ordering::Relaxed);
+            if nonce < best_n {
+                let mut best_lock = best.lock().unwrap();
+                if zeros > best_lock.leading_zeros
+                    || (zeros == best_lock.leading_zeros && nonce < best_lock.nonce)
+                {
+                    best_lock.leading_zeros = zeros;
+                    best_lock.nonce = nonce;
+                    best_lock.hash.copy_from_slice(&hash_output);
+                    best_lock.has_hash = true;
+                    best_zeros.store(best_lock.leading_zeros, Ordering::Relaxed);
+                    best_nonce.store(best_lock.nonce, Ordering::Relaxed);
+                }
+            }
         }
 
         nonce += thread_count as u64;
+    }
+
+    if local_count > 0 {
+        hash_counter.fetch_add(local_count, Ordering::Relaxed);
     }
 }
 
@@ -255,6 +348,8 @@ fn gpu_worker(
     found: Arc<AtomicBool>,
     tx: tokio::sync::mpsc::Sender<MiningResult>,
     best: Arc<std::sync::Mutex<BestHashState>>,
+    best_zeros: Arc<AtomicU32>,
+    best_nonce: Arc<AtomicU64>,
     hash_counter: Arc<AtomicU64>,
 ) {
     let stride = 32usize;
@@ -262,13 +357,11 @@ fn gpu_worker(
     let mut pw_lens = vec![0u32; batch_size];
     let mut hashes = vec![0u8; batch_size * 32];
     let mut nonce_base = 0u64;
-    let mut local_best_zeros: u32 = 0;
-    let mut local_best_nonce: u64 = u64::MAX;
 
     while !found.load(Ordering::Relaxed) {
         for i in 0..batch_size {
             let offset = i * stride;
-            let len = u64_to_ascii(&mut pw_buf[offset..offset + stride], nonce_base + i as u64);
+            let len = u64_to_ascii_inplace(&mut pw_buf[offset..offset + stride], nonce_base + i as u64);
             pw_lens[i] = len as u32;
         }
 
@@ -292,17 +385,34 @@ fn gpu_worker(
                 return;
             }
 
-            if zeros > local_best_zeros || (zeros == local_best_zeros && nonce < local_best_nonce) {
+            let best_z = best_zeros.load(Ordering::Relaxed);
+            if zeros > best_z {
                 let mut best_lock = best.lock().unwrap();
                 if zeros > best_lock.leading_zeros
                     || (zeros == best_lock.leading_zeros && nonce < best_lock.nonce)
                 {
                     best_lock.leading_zeros = zeros;
                     best_lock.nonce = nonce;
-                    best_lock.hash_hex = hex::encode(hash);
+                    best_lock.hash.copy_from_slice(hash);
+                    best_lock.has_hash = true;
+                    best_zeros.store(best_lock.leading_zeros, Ordering::Relaxed);
+                    best_nonce.store(best_lock.nonce, Ordering::Relaxed);
                 }
-                local_best_zeros = best_lock.leading_zeros;
-                local_best_nonce = best_lock.nonce;
+            } else if zeros == best_z {
+                let best_n = best_nonce.load(Ordering::Relaxed);
+                if nonce < best_n {
+                    let mut best_lock = best.lock().unwrap();
+                    if zeros > best_lock.leading_zeros
+                        || (zeros == best_lock.leading_zeros && nonce < best_lock.nonce)
+                    {
+                        best_lock.leading_zeros = zeros;
+                        best_lock.nonce = nonce;
+                        best_lock.hash.copy_from_slice(hash);
+                        best_lock.has_hash = true;
+                        best_zeros.store(best_lock.leading_zeros, Ordering::Relaxed);
+                        best_nonce.store(best_lock.nonce, Ordering::Relaxed);
+                    }
+                }
             }
         }
 
@@ -317,6 +427,8 @@ fn gpu_worker(
 struct CpuMiningJob {
     found: Arc<AtomicBool>,
     best: Arc<std::sync::Mutex<BestHashState>>,
+    best_zeros: Arc<AtomicU32>,
+    best_nonce: Arc<AtomicU64>,
     hash_counter: Arc<AtomicU64>,
     handles: Vec<std::thread::JoinHandle<()>>,
     start_time: Instant,
@@ -339,10 +451,15 @@ impl CpuMiningJob {
         let found = Arc::new(AtomicBool::new(false));
         let best = Arc::new(std::sync::Mutex::new(BestHashState {
             nonce: 0,
-            hash_hex: String::new(),
+            hash: [0u8; 32],
             leading_zeros: 0,
+            has_hash: false,
         }));
         let hash_counter = Arc::new(AtomicU64::new(0));
+        let best_zeros = Arc::new(AtomicU32::new(0));
+        let best_nonce = Arc::new(AtomicU64::new(0));
+        let best_zeros = Arc::new(AtomicU32::new(0));
+        let best_nonce = Arc::new(AtomicU64::new(0));
 
         let start_time = Instant::now();
         let mut handles = Vec::with_capacity(thread_count as usize);
@@ -368,6 +485,8 @@ impl CpuMiningJob {
                     found,
                     tx,
                     best,
+                    best_zeros.clone(),
+                    best_nonce.clone(),
                     counter,
                 );
             }));
@@ -376,6 +495,8 @@ impl CpuMiningJob {
         CpuMiningJob {
             found,
             best,
+            best_zeros,
+            best_nonce,
             hash_counter,
             handles,
             start_time,
@@ -391,7 +512,7 @@ impl CpuMiningJob {
             let _ = h.join();
         }
         let best = self.best.lock().unwrap();
-        (best.nonce, best.hash_hex.clone(), best.leading_zeros)
+        (best.nonce, if best.has_hash { hex::encode(best.hash) } else { String::new() }, best.leading_zeros)
     }
 
     /// 获取当前状态用于推送
@@ -413,7 +534,7 @@ impl CpuMiningJob {
         ServerMsg::Status {
             hash_rate,
             best_nonce: best.nonce,
-            best_hash: best.hash_hex.clone(),
+            best_hash: if best.has_hash { hex::encode(best.hash) } else { String::new() },
             best_leading_zeros: best.leading_zeros,
         }
     }
@@ -423,6 +544,8 @@ impl CpuMiningJob {
 struct GpuMiningJob {
     found: Arc<AtomicBool>,
     best: Arc<std::sync::Mutex<BestHashState>>,
+    best_zeros: Arc<AtomicU32>,
+    best_nonce: Arc<AtomicU64>,
     hash_counter: Arc<AtomicU64>,
     handle: Option<std::thread::JoinHandle<()>>,
     start_time: Instant,
@@ -447,10 +570,15 @@ impl GpuMiningJob {
         let found = Arc::new(AtomicBool::new(false));
         let best = Arc::new(std::sync::Mutex::new(BestHashState {
             nonce: 0,
-            hash_hex: String::new(),
+            hash: [0u8; 32],
             leading_zeros: 0,
+            has_hash: false,
         }));
         let hash_counter = Arc::new(AtomicU64::new(0));
+        let best_zeros = Arc::new(AtomicU32::new(0));
+        let best_nonce = Arc::new(AtomicU64::new(0));
+        let best_zeros = Arc::new(AtomicU32::new(0));
+        let best_nonce = Arc::new(AtomicU64::new(0));
 
         let salt = format!("{}|{}|{}", seed, visitor_id, ip);
         let miner = gpu::GpuMiner::new(
@@ -475,6 +603,8 @@ impl GpuMiningJob {
                 found_t,
                 solution_tx,
                 best_t,
+                best_zeros.clone(),
+                best_nonce.clone(),
                 counter_t,
             );
         });
@@ -482,6 +612,8 @@ impl GpuMiningJob {
         Ok(GpuMiningJob {
             found,
             best,
+            best_zeros,
+            best_nonce,
             hash_counter,
             handle: Some(handle),
             start_time,
@@ -496,7 +628,7 @@ impl GpuMiningJob {
             let _ = handle.join();
         }
         let best = self.best.lock().unwrap();
-        (best.nonce, best.hash_hex.clone(), best.leading_zeros)
+        (best.nonce, if best.has_hash { hex::encode(best.hash) } else { String::new() }, best.leading_zeros)
     }
 
     fn get_status(&mut self) -> ServerMsg {
@@ -517,7 +649,7 @@ impl GpuMiningJob {
         ServerMsg::Status {
             hash_rate,
             best_nonce: best.nonce,
-            best_hash: best.hash_hex.clone(),
+            best_hash: if best.has_hash { hex::encode(best.hash) } else { String::new() },
             best_leading_zeros: best.leading_zeros,
         }
     }
@@ -937,11 +1069,15 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    let detected_threads: u32 = num_cpus::get().max(1) as u32;
+    let reserve_threads: u32 = if detected_threads >= 8 { 2 } else { 1 };
+    let default_threads: u32 = detected_threads.saturating_sub(reserve_threads).max(1);
+
     let thread_count: u32 = args
         .iter()
         .find(|a| a.starts_with("--threads="))
         .and_then(|a| a.trim_start_matches("--threads=").parse().ok())
-        .unwrap_or(num_cpus::get() as u32);
+        .unwrap_or(default_threads);
 
     let port: u16 = args
         .iter()
